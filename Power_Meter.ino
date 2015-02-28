@@ -3,42 +3,111 @@
  Collecting data by eavesdropping on the MOSI-line (master in slave out)
  between the energy monitoring chip (ECH1560) and the main processor*/
 
-const int CLKPin = 2; // Pin connected to CLK (D2 & INT0)
-const int MISOPin = 5;  // Pin connected to SDO (D5), from the CS5460A
-const int MOSIPin = 6;  // Pin connected to SDI (D6), from the key pad/LCD MCU
+#define CLKPin  2 // Pin connected to CLK (D2 & INT0)
+#define MISOPin 5 // Pin connected to SDO (D5), from the CS5460A
+#define MOSIPin 6 // Pin connected to SDI (D6), from the key pad/LCD MCU
 
-//All variables that is changed in the interrupt function must be volatile to make sure changes are saved. 
-volatile int Ba = 0;   //Store MISO-byte 1
-volatile int Bb = 0;   //Store MISO-byte 2
-volatile int Bc = 0;   //Store MISO-byte 2
-float U = 0;    //voltage
-float P = 0;    //power
-float ReadData[3] = { 0, 0, 0 }; //Array to hold mean values of [U,I,P]
+// All variables that is changed in the interrupt function must be volatile to make sure changes are saved. 
+volatile boolean clockTick = false;     // Set when a clock tick happens
+volatile boolean byteComplete = false;  // Set when a byte is complete
+volatile boolean gotSync = false;       // Set when we have detected the first long gap and we know we are at the start of a sequence of commands
 
-volatile long CountBits = 0;      // Count read bits
-volatile int Antal = 0;           // number of read values (to calculate mean)
-volatile long ClkHighCount = 0;   // Number of CLK-highs (find start of a Byte)
-volatile boolean inSync = false;  // as long as we are in SPI-sync
-volatile boolean NextBit = true;  // A new bit is detected
+volatile int sdiByte = 0;               // The SDI value
+volatile int sdoByte = 0;               // The SDO value
 
+// Set when we detect the long clock gap, cleared when first byte has been received
+boolean startBlock = false;  
 
-volatile int sdiByte = 0;
-volatile int sdoByte = 0;
+// Total number of bytes received
+int byteCount = 0;
 
-volatile boolean byteComplete = false;
+// The current command register value, see below
+int commandRegister = 0;
 
-int sync0Count = 0;
-int value = 0;
+// The value being read/written
+uint32_t registerValue = 0;
+
+// Number of bytes received in the packet
+int packetByteCount = 0;
+
+// The time of the last clock tick in ms
+unsigned long lastClockTick = 0;
+
+// Set to true if an error was detected when reading the packet
+boolean packetError = false;
+
+// The status of the CS5460
+long status = 0;
 
 // Commands
-#define SYNC0 0xFE
-#define SYNC1 0xFF
+#define SYNC0                   B11111110
+#define SYNC1                   B11111111
+
+#define START_CONVERSION_SINGLE B11100000
+#define START_CONVERSION_CONT   B11101000
+
+#define POWER_UP                B10100000
+
+#define POWER_DOWN_RESERVED_1   B10000000
+#define POWER_DOWN_STAND_BY     B10010000
+#define POWER_DOWN_SLEEP        B10001000
+#define POWER_DOWN_RESERVED_2   B10011000
+
+#define CALIBRATION_MASK        B11000000
+#define CALIBRATION_MASK_VI     B00011000
+#define CALIBRATION_MASK_R      B00000100
+#define CALIBRATION_MASK_G      B00000010
+#define CALIBRATION_MASK_O      B00000001
+
+#define REGISTER_WRITE          B01000000
+#define REGISTER_WRITE_MASK     B11000001
+
+#define REGISTER_WRITE_Config   B01000000
+#define REGISTER_WRITE_LDCoff   B01000010
+#define REGISTER_WRITE_Ign      B01000100
+#define REGISTER_WRITE_VDCoff   B01000110
+#define REGISTER_WRITE_Vgn      B01001000
+#define REGISTER_WRITE_Cycle    B01001010
+#define REGISTER_WRITE_Pulse    B01001100
+#define REGISTER_WRITE_I        B01001110
+#define REGISTER_WRITE_V        B01010000
+#define REGISTER_WRITE_P        B01010010
+#define REGISTER_WRITE_E        B01010100
+#define REGISTER_WRITE_I_RMS    B01010110
+#define REGISTER_WRITE_V_RMS    B01011000
+#define REGISTER_WRITE_TBC      B01011010
+#define REGISTER_WRITE_Poff     B01011100
+#define REGISTER_WRITE_Status   B01011110
+#define REGISTER_WRITE_IACoff   B01100000
+#define REGISTER_WRITE_VACoff   B01100010
+#define REGISTER_WRITE_Test     B01110010
+#define REGISTER_WRITE_Mask     B01110100
+#define REGISTER_WRITE_Ctrl     B01110000
+
+#define REGISTER_READ_Config    B00000000
+#define REGISTER_READ_LDCoff    B00000010
+#define REGISTER_READ_Ign       B00000100
+#define REGISTER_READ_VDCoff    B00000110
+#define REGISTER_READ_Vgn       B00001000
+#define REGISTER_READ_Cycle     B00001010
+#define REGISTER_READ_Pulse     B00001100
+#define REGISTER_READ_I         B00001110
+#define REGISTER_READ_V         B00010000
+#define REGISTER_READ_P         B00010010
+#define REGISTER_READ_E         B00010100
+#define REGISTER_READ_I_RMS     B00010110
+#define REGISTER_READ_V_RMS     B00011000
+#define REGISTER_READ_TBC       B00011010
+#define REGISTER_READ_Poff      B00011100
+#define REGISTER_READ_Status    B00011110
+#define REGISTER_READ_IACoff    B00100000
+#define REGISTER_READ_VACoff    B00100010
+#define REGISTER_READ_Test      B00110010
+#define REGISTER_READ_Mask      B00110100
+#define REGISTER_READ_Ctrl      B00110000
 
 void setup()
 {
-  //Setting up interrupt ISR on D2 (INT0), trigger function "CLK_ISR()" when INT0 (CLK)is rising
-  attachInterrupt(0, CLK_ISR, RISING);
-
   //Set the CLK-pin (D2) to input
   pinMode(CLKPin, INPUT);
 
@@ -48,224 +117,147 @@ void setup()
   //Set the MOSI-pin (D6) to input
   pinMode(MOSIPin, INPUT);
 
-  // initialize serial communications at 9600 bps: (to computer)
+  // Setting up interrupt ISR on D2 (INT0), trigger function "CLK_ISR()" when INT0 (CLK)is rising
+  attachInterrupt(0, CLK_ISR, RISING);
+
+  // initialize serial communications at 115200 bps: (to computer)
   pinMode(8, OUTPUT);    // initialize pin 8 to control the radio
   digitalWrite(8, HIGH); // select the radio
   Serial.begin(115200);
+  Serial.println("Power Monitor!");
 
   pinMode(13, OUTPUT);
+  digitalWrite(13, HIGH);
+}
+
+
+double RegistValueToDouble(uint32_t registerValue, int pointPos)
+{
+  double fp = registerValue;
+  return fp / (double)(1 << pointPos);
 }
 
 void loop()
 {
-  digitalWrite(13, inSync ? LOW : HIGH);
-  if (inSync)
+  if (clockTick)
   {
-    if (byteComplete)
+    clockTick = false;
+    lastClockTick = millis();
+  }
+
+  if (false == startBlock && millis() > lastClockTick + 4)
+  {
+    gotSync = true;
+    startBlock = true;
+    
+    Serial.println("--");
+    byteCount = 0;
+    digitalWrite(13, HIGH);
+  }
+
+  if (byteComplete) 
+  {
+    byteComplete = false;
+
+    byteCount++;
+
+    if (startBlock) 
     {
-      Serial.print("SDI: 0x");
-      Serial.print(sdiByte, HEX);
-      Serial.print("SDO: 0x");
-      Serial.println(sdoByte, HEX);
-      byteComplete = false;
+      startBlock = false;
+
+      digitalWrite(13, LOW);
+
+      packetByteCount = 0;
+      registerValue = 0;
+      commandRegister = 0;
+      packetError = false;
+    }
+
+    if (0 == packetByteCount)
+    {
+      commandRegister = sdiByte;
+    }
+    else if (SYNC0 == sdiByte && 0 == (commandRegister & REGISTER_WRITE_MASK))
+    {
+      registerValue = (registerValue << 8) | sdoByte;
+    }
+    else if (REGISTER_WRITE == (commandRegister & REGISTER_WRITE_MASK))
+    {
+      registerValue = (registerValue << 8) | sdiByte;
+    }
+    else
+    {
+//      Serial.print(sdiByte, HEX);
+//      Serial.print("!");
+//      packetError = true;
+    }
+      
+    if (4 == ++packetByteCount)
+    {
+      if (false == packetError /* && SYNC1 != commandRegister && 0 != commandRegister */)
+      {
+        switch (commandRegister)
+        {
+          case SYNC1:
+            break;
+          case REGISTER_READ_Status:
+            status = registerValue;
+            break;
+          case REGISTER_WRITE_Status:
+            break;
+          case REGISTER_READ_I_RMS:
+            Serial.print("I: ");
+            Serial.println(RegistValueToDouble(registerValue, 17));
+            break;
+          case REGISTER_READ_V_RMS:
+            Serial.print("V: ");
+            Serial.println(-RegistValueToDouble(registerValue, 15));
+            break;
+          case REGISTER_READ_E:
+            break;
+          default:
+            Serial.print(">");
+            Serial.print(commandRegister, BIN);
+            Serial.print(REGISTER_WRITE == (commandRegister & REGISTER_WRITE_MASK) ? ">" : "<");
+            Serial.println(registerValue);
+            break;
+        }
+      }
+
+      packetByteCount = 0;
+      registerValue = 0;
+      commandRegister = 0;
+      packetError = false;
     }
   }
-/*
-  //do nothing until the CLK-interrupt occures and sets inSync=true
-  if (inSync == true)
-  {
-    CountBits = 0;  // CLK-interrupt increments CountBits when new bit is received
-
-    while (CountBits < 40){}  //skip the uninteresting 5 first bytes
-
-    CountBits = 0;
-    Ba = 0;
-    Bb = 0;
-
-    while (CountBits < 24)
-    {
-      // Loop through the next 3 Bytes (6-8) and save byte 6 and 7 in Ba and Bb
-      if (NextBit == true)
-      {
-        // when rising edge on CLK is detected, NextBit = true in in interrupt. 
-        if (CountBits < 9)
-        {
-          // first Byte/8 bits in Ba
-          // Shift Ba one bit to left and store MISO-value (0 or 1) (see http://arduino.cc/en/Reference/Bitshift)
-          Ba = (Ba << 1);
-          //read MISO-pin, if high: make Ba[0] = 1
-          if (digitalRead(MISOPin) == HIGH) {
-            Ba |= (1 << 0);  //changes first bit of Ba to "1"
-          }   //doesn't need "else" because BaBb[0] is zero if not changed.
-          NextBit = false; //reset NextBit in wait for next CLK-interrupt
-        }
-        else if (CountBits < 17)
-        {
-          // bit 9-16 is byte 7, stor in Bb
-          Bb = Bb << 1;  //Shift Ba one bit to left and store MISO-value (0 or 1)
-          // read MISO-pin, if high: make Ba[0] = 1
-          if (digitalRead(MISOPin) == HIGH) {
-            Bb |= (1 << 0);  //changes first bit of Bb to "1"
-          }
-          NextBit = false;  //reset NextBit in wait for next CLK-interrupt
-        }
-      }
-    }
-    if (Bb != 3)
-    {
-      //if bit Bb is not 3, we have reached the important part, U is allready in Ba and Bb and next 8 Bytes will give us the Power. 
-      Antal += 1;  //increment for mean value calculations
-
-      //Voltage = 2*(Ba+Bb/255)
-      U = 2.0*((float)Ba + (float)Bb / 255.0);
-
-      //Power:
-      CountBits = 0;
-      while (CountBits < 40){}//Start reading the next 8 Bytes by skipping the first 5 uninteresting ones
-
-      CountBits = 0;
-      Ba = 0;
-      Bb = 0;
-      Bc = 0;
-      while (CountBits < 24)
-      {
-        //store byte 6, 7 and 8 in Ba and Bb & Bc. 
-        if (NextBit == true)
-        {
-          if (CountBits < 9)
-          {
-            Ba = (Ba << 1);  //Shift Ba one bit to left and store MISO-value (0 or 1)
-            //read MISO-pin, if high: make Ba[0] = 1
-            if (digitalRead(MISOPin) == HIGH){
-              Ba |= (1 << 0);  //changes first bit of Ba to "1"
-            }
-            NextBit = false;
-          }
-          else if (CountBits < 17) 
-          {
-            Bb = Bb << 1;  //Shift Ba one bit to left and store MISO-value (0 or 1)
-            //read MISO-pin, if high: make Ba[0] = 1
-            if (digitalRead(MISOPin) == HIGH){
-              Bb |= (1 << 0);  //changes first bit of Bb to "1"
-            }
-            NextBit = false;
-          }
-          else
-          {
-            Bc = Bc << 1;  //Shift Bc one bit to left and store MISO-value (0 or 1)
-            //read MISO-pin, if high: make Bc[0] = 1
-            if (digitalRead(MISOPin) == HIGH) {
-              Bc |= (1 << 0);  //changes first bit of Bc to "1"
-            }
-            NextBit = false;
-          }
-        }
-      }
-
-      Ba = 255 - Ba;
-      Bb = 255 - Bb;
-      Bc = 255 - Bc;
-
-      //Power = (Ba*255+Bb)/2
-      P = ((float)Ba * 255 + (float)Bb + (float)Bc / 255.0) / 2;
-
-      //Voltage mean
-      ReadData[0] = (U + ReadData[0] * ((float)Antal - 1)) / (float)Antal;
-
-      //Current mean
-      ReadData[1] = (P / U + ReadData[1] * ((float)Antal - 1)) / (float)Antal;
-
-      //Power mean
-      ReadData[2] = (P + ReadData[2] * ((float)Antal - 1)) / (float)Antal;
-
-      // Print out results (i skipped the mean values since the actual ones are very stable)
-      Serial.print("U: ");
-      Serial.print(U, 1);
-      Serial.println("V");
-      Serial.print("I: ");
-      Serial.print(P / U * 1000, 0);  //I=P/U and in milli ampere
-      Serial.println("mA");
-      Serial.print("P: ");
-      Serial.print(P, 1);
-      Serial.println("W");
-      Serial.println("");
-
-      if (Antal == 10) 
-      {
-        //every 10th 70-package = every ~10s
-        //transmit ReadData-array to nRF or Wifi-module here:
-        //transmission function here...
-
-        //Reset ReadData-array
-        ReadData[0] = 0;
-        ReadData[1] = 0;
-        ReadData[2] = 0;
-        //reset mean-value counter 
-        Antal = 0;
-      }
-      inSync = false;  //reset sync variable to make sure next reading is in sync. 
-    }
-
-
-    if (Bb == 0) {  //If Bb is not 3 or something else than 0, something is wrong! 
-      inSync = false;
-      Serial.println("Nothing connected, or out of sync!");
-    }
-  }
-*/
 }
 
 // Temp vars for the ISR to construct the bytes, gives loop a bit of time to process the data before being corrupted
 int tempSdiByte = 0;
 int tempSdoByte = 0;
+int countBits = 0;      // Count read bits
 
 // Function that triggers whenever CLK-pin is rising (goes high)
 void CLK_ISR()
 {
-  tempSdiByte = ((tempSdiByte << 1) | (digitalRead(MOSIPin) == HIGH ? 1 : 0)) & 0xFF;
-  tempSdoByte = ((tempSdoByte << 1) | (digitalRead(MISOPin) == HIGH ? 1 : 0)) & 0xFF;
+  int bits = PIND;
 
-  if (inSync)
+  clockTick = true;
+
+  if(gotSync)
   {
-    CountBits += 1;
-    if (8 == CountBits) 
+    tempSdiByte = (tempSdiByte << 1) | ((bits >> MOSIPin) & 1);
+    tempSdoByte = (tempSdoByte << 1) | ((bits >> MISOPin) & 1);
+
+    if (8 == ++countBits) 
     {
       sdiByte = tempSdiByte;
       sdoByte = tempSdoByte;
       byteComplete = true;
-      CountBits = 0;
+      countBits = 0;
+      tempSdiByte = 0;
+      tempSdoByte = 0;
     }
   }
-  else
-  {
-    if (SYNC0 == tempSdiByte)
-    {
-      inSync = true;
-    }
-  }
-/*
-  //if we are trying to find the sync-time (CLK goes high for 1-2ms)
-  if (inSync == false)
-  {
-    ClkHighCount = 0;
-    //Register how long the ClkHigh is high to evaluate if we are at the part wher clk goes high for 1-2 ms
-    while (digitalRead(CLKPin) == HIGH)
-    {
-      ClkHighCount += 1;
-      delayMicroseconds(30);  //can only use delayMicroseconds in an interrupt. 
-    }
-    //if the Clk was high between 1 and 2 ms than, its a start of a SPI-transmission
-    if (ClkHighCount >= 33 && ClkHighCount <= 67) {
-      inSync = true;
-    }
-  }
-  else
-  {
-    // we are in sync and logging CLK-highs
-    // increment an integer to keep track of how many bits we have read. 
-    CountBits += 1;
-    NextBit = true;
-  }
-*/
 }
 
