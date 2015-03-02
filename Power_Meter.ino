@@ -134,7 +134,7 @@ void setup()
 double RegistValueToDouble(uint32_t registerValue, int pointPos)
 {
   double fp = registerValue;
-  return fp / (double)(1 << pointPos);
+  return fp / double(1L << pointPos);
 }
 
 void loop()
@@ -207,11 +207,11 @@ void loop()
             break;
           case REGISTER_READ_I_RMS:
             Serial.print("I: ");
-            Serial.println(RegistValueToDouble(registerValue, 17));
+            Serial.println(RegistValueToDouble(registerValue, 19),3);
             break;
           case REGISTER_READ_V_RMS:
             Serial.print("V: ");
-            Serial.println(-RegistValueToDouble(registerValue, 15));
+            Serial.println(RegistValueToDouble(registerValue, 15));
             break;
           case REGISTER_READ_E:
             break;
