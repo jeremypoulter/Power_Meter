@@ -25,7 +25,7 @@ int byteCount = 0;
 int commandRegister = 0;
 
 // The value being read/written
-uint32_t registerValue = 0;
+int32_t registerValue = 0;
 
 // Number of bytes received in the packet
 int packetByteCount = 0;
@@ -37,7 +37,19 @@ unsigned long lastClockTick = 0;
 boolean packetError = false;
 
 // The status of the CS5460
-long status = 0;
+int32_t status = 0;
+
+// Last RMS voltage reported, fixed point 16/16
+boolean gotVoltageRms = false;
+int32_t voltageRms = 0;
+
+// Last RMS current reported, fixed point 12/20
+boolean gotCurrentRms = false;
+int32_t currentRms = 0;
+
+// Last Energy reported, fixed point ?/?
+boolean gotEnergy = false;
+int32_t energy = 0;
 
 // Commands
 #define SYNC0                   B11111110
@@ -131,7 +143,7 @@ void setup()
 }
 
 
-double RegistValueToDouble(uint32_t registerValue, int pointPos)
+double RegistValueToDouble(int32_t registerValue, int pointPos)
 {
   double fp = registerValue;
   return fp / double(1L << pointPos);
@@ -149,7 +161,26 @@ void loop()
   {
     gotSync = true;
     startBlock = true;
-    
+
+    if (gotVoltageRms && gotCurrentRms)
+    {
+      // IMPROVE: We have the values as fixed point so probably faster to do the 
+      //          calculations as fixed point
+      double vRms = RegistValueToDouble(voltageRms, 15);
+      double iRms = RegistValueToDouble(currentRms, 19);
+      double ap = iRms * vRms;
+
+      Serial.print("V: ");
+      Serial.println(vRms);
+      Serial.print("I: ");
+      Serial.println(iRms, 3);
+      Serial.print("W: ");
+      Serial.println(ap);
+    }
+    gotVoltageRms = false;
+    gotCurrentRms = false;
+    gotEnergy = false;
+
     Serial.println("--");
     byteCount = 0;
     digitalWrite(13, HIGH);
@@ -201,19 +232,39 @@ void loop()
           case SYNC1:
             break;
           case REGISTER_READ_Status:
-            status = registerValue;
+            if (status != registerValue)
+            {
+              status = registerValue;
+              // Serial.print("Status: ");
+              // Serial.println(status, BIN);
+            }
             break;
           case REGISTER_WRITE_Status:
+            // Serial.print("Status> ");
+            // Serial.println(registerValue, BIN);
             break;
           case REGISTER_READ_I_RMS:
-            Serial.print("I: ");
-            Serial.println(RegistValueToDouble(registerValue, 19),3);
+            // Serial.print("I: ");
+            // Serial.println(RegistValueToDouble(registerValue, 19),3);
+            currentRms = registerValue;
+            gotCurrentRms = true;
             break;
           case REGISTER_READ_V_RMS:
-            Serial.print("V: ");
-            Serial.println(RegistValueToDouble(registerValue, 15));
+            // Serial.print("V: ");
+            // Serial.println(RegistValueToDouble(registerValue, 15));
+            voltageRms = registerValue;
+            gotVoltageRms = true;
             break;
           case REGISTER_READ_E:
+            // E is signed so as the register value is 24 bits we need to fill in 
+            // the top 8 bits with 1 if negative
+            if (registerValue & (1L << 23)) {
+              registerValue |= 0xFF000000;
+            }
+            // Serial.print("E: ");
+            // Serial.println(RegistValueToDouble(registerValue, 21), 5);
+            energy = registerValue;
+            gotEnergy = true;
             break;
           default:
             Serial.print(">");
