@@ -15,6 +15,8 @@ volatile boolean gotSync = false;       // Set when we have detected the first l
 volatile int sdiByte = 0;               // The SDI value
 volatile int sdoByte = 0;               // The SDO value
 
+volatile boolean resetValues = false;   // reset the state of the vars used by the ISR
+
 // Set when we detect the long clock gap, cleared when first byte has been received
 boolean startBlock = false;  
 
@@ -154,28 +156,35 @@ void loop()
   if (clockTick)
   {
     clockTick = false;
-    lastClockTick = millis();
+    lastClockTick = micros();
   }
 
-  if (false == startBlock && millis() > lastClockTick + 4)
+  if (false == startBlock && micros() > lastClockTick + 5000)
   {
-    gotSync = true;
     startBlock = true;
+    gotSync = true;
+    resetValues = true;
 
-    if (gotVoltageRms && gotCurrentRms)
+    if (gotVoltageRms && gotCurrentRms && gotEnergy)
     {
       // IMPROVE: We have the values as fixed point so probably faster to do the 
       //          calculations as fixed point
       double vRms = RegistValueToDouble(voltageRms, 15);
       double iRms = RegistValueToDouble(currentRms, 19);
-      double ap = iRms * vRms;
+      double realPower = RegistValueToDouble(energy, 9);
+      double apparentPower = iRms * vRms;
+      double powerFactor = realPower / apparentPower;
 
       Serial.print("V: ");
       Serial.println(vRms);
       Serial.print("I: ");
       Serial.println(iRms, 3);
-      Serial.print("W: ");
-      Serial.println(ap);
+      Serial.print("Wr: ");
+      Serial.println(realPower);
+      Serial.print("Wa: ");
+      Serial.println(apparentPower);
+      Serial.print("PF: ");
+      Serial.println(powerFactor);
     }
     gotVoltageRms = false;
     gotCurrentRms = false;
@@ -208,7 +217,7 @@ void loop()
     {
       commandRegister = sdiByte;
     }
-    else if (SYNC0 == sdiByte && 0 == (commandRegister & REGISTER_WRITE_MASK))
+    else if (SYNC0 == sdiByte && REGISTER_WRITE != (commandRegister & REGISTER_WRITE_MASK))
     {
       registerValue = (registerValue << 8) | sdoByte;
     }
@@ -218,14 +227,14 @@ void loop()
     }
     else
     {
-//      Serial.print(sdiByte, HEX);
-//      Serial.print("!");
-//      packetError = true;
+      // Serial.print(sdiByte, HEX);
+      // Serial.print("!");
+      packetError = true;
     }
       
     if (4 == ++packetByteCount)
     {
-      if (false == packetError /* && SYNC1 != commandRegister && 0 != commandRegister */)
+      if (false == packetError)
       {
         switch (commandRegister)
         {
@@ -260,9 +269,10 @@ void loop()
             // the top 8 bits with 1 if negative
             if (registerValue & (1L << 23)) {
               registerValue |= 0xFF000000;
+              registerValue *= -1;
             }
             // Serial.print("E: ");
-            // Serial.println(RegistValueToDouble(registerValue, 21), 5);
+            // Serial.println(RegistValueToDouble(registerValue, 9), 2);
             energy = registerValue;
             gotEnergy = true;
             break;
@@ -295,6 +305,14 @@ void CLK_ISR()
 
   clockTick = true;
 
+  if (resetValues) 
+  {
+    resetValues = false;
+    countBits = 0;
+    tempSdiByte = 0;
+    tempSdoByte = 0;
+  }
+
   if(gotSync)
   {
     tempSdiByte = (tempSdiByte << 1) | ((bits >> MOSIPin) & 1);
@@ -305,9 +323,7 @@ void CLK_ISR()
       sdiByte = tempSdiByte;
       sdoByte = tempSdoByte;
       byteComplete = true;
-      countBits = 0;
-      tempSdiByte = 0;
-      tempSdoByte = 0;
+      resetValues = true;
     }
   }
 }
